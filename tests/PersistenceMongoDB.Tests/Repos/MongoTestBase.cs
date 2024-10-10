@@ -3,11 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using MongoDB.Bson;
 using MongoDB.Driver;
-using MongoDB.Driver.Linq;
 using NUnit.Framework;
-using Persistence;
-using PersistenceMongoDB.Serializers;
 
 namespace PersistenceMongoDB.Tests.Repos
 {
@@ -20,8 +18,6 @@ namespace PersistenceMongoDB.Tests.Repos
     public abstract class MongoTestBase
     {
         private const string ReplicaSetName = "rs0";
-        private static readonly Random Random = new Random();
-
         private MongoClient _client = null!;
         private readonly List<string> _temporaryDatabases = new List<string>();
 
@@ -32,29 +28,24 @@ namespace PersistenceMongoDB.Tests.Repos
         [OneTimeSetUp]
         public void SetUpMongoClient()
         {
-            // Register custom serializers if needed
-            CustomSerializers.RegisterAll();
-
+            var connectionString = "mongodb://root:example@localhost:27017/?replicaSet=rs0";
             try
             {
-                // Configure MongoDB client settings to connect in replica set mode
-                MongoClientSettings settings = MongoClientSettings
-                    .FromConnectionString($"mongodb://localhost:27017/?replicaSet={ReplicaSetName}");
-                settings.LinqProvider = LinqProvider.V3;
-
-                // Initialize MongoDB client
+                var settings = MongoClientSettings.FromConnectionString(connectionString);
                 _client = new MongoClient(settings);
 
-                // Test connection with a timeout to ensure MongoDB is running
-                bool success = _client.ListDatabaseNamesAsync(CancellationToken.None).Wait(TimeSpan.FromSeconds(5));
-                if (!success)
+                // Check if the replica set is initialized
+                if (!IsReplicaSetInitialized())
                 {
-                    Assert.Fail("MongoDB instance not available on localhost:27017. Failing integration tests.");
+                    InitializeReplicaSet();
                 }
+
+                // Test connection with a timeout to ensure MongoDB is running
+                _client.ListDatabaseNames(CancellationToken.None);
             }
             catch (Exception ex)
             {
-                Assert.Fail($"Failing tests due to MongoDB connection failure: {ex.Message}");
+                Assert.Fail($"Failed to connect to MongoDB: {ex.Message}");
             }
         }
 
@@ -64,7 +55,6 @@ namespace PersistenceMongoDB.Tests.Repos
         [OneTimeTearDown]
         public void TearDownTempDatabases()
         {
-            // Asynchronously drop all temporary databases
             Task.WhenAll(_temporaryDatabases.Select(db => _client.DropDatabaseAsync(db))).Wait();
         }
 
@@ -75,9 +65,47 @@ namespace PersistenceMongoDB.Tests.Repos
         /// <returns>A new temporary IMongoDatabase instance.</returns>
         protected IMongoDatabase CreateTemporaryDatabase()
         {
-            string dbName = "testdb-" + Random.Next();
+            string dbName = "testdb-" + Guid.NewGuid();
             _temporaryDatabases.Add(dbName);
             return _client.GetDatabase(dbName);
+        }
+
+        /// <summary>
+        /// Checks if the replica set has already been initialized.
+        /// </summary>
+        private bool IsReplicaSetInitialized()
+        {
+            try
+            {
+                var adminDb = _client.GetDatabase("admin");
+                var command = new BsonDocument("replSetGetStatus", 1);
+                adminDb.RunCommand<BsonDocument>(command);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Initializes the MongoDB replica set.
+        /// </summary>
+        private void InitializeReplicaSet()
+        {
+            var adminDb = _client.GetDatabase("admin");
+            var config = new BsonDocument
+            {
+                { "_id", ReplicaSetName },
+                { "members", new BsonArray
+                    {
+                        new BsonDocument { { "_id", 0 }, { "host", "localhost:27017" } }
+                    }
+                }
+            };
+
+            adminDb.RunCommand<BsonDocument>(new BsonDocument { { "replSetInitiate", config } });
+            Thread.Sleep(5000); // Wait for the replica set to initialize
         }
     }
 }
